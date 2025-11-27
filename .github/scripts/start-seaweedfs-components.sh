@@ -1,18 +1,18 @@
 #!/bin/bash
 
-# SeaweedFS Component Startup Script
+# SeaweedFS Component Startup Script - Version Améliorée
 # Usage: ./start-seaweedfs-components.sh [options]
-# 
-# This script starts SeaweedFS components individually for testing:
-# 1. Master server
-# 2. Volume server(s)
-# 3. Filer
-# 4. S3 gateway (optional)
-# 5. MQ broker (optional)
+#
+# This script starts SeaweedFS components individually for testing and development
 
-set -e
+set -euo pipefail
 
-# Default configuration
+# Configuration avec validation
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_VERSION="2.0.0"
+
+# Default configuration avec valeurs raisonnables
 MASTER_PORT=${MASTER_PORT:-9333}
 VOLUME_PORT=${VOLUME_PORT:-8080}
 FILER_PORT=${FILER_PORT:-8888}
@@ -20,481 +20,779 @@ S3_PORT=${S3_PORT:-8000}
 MQ_PORT=${MQ_PORT:-17777}
 METRICS_PORT=${METRICS_PORT:-9324}
 
-DATA_DIR=${WEED_DATA_DIR:-"/tmp/seaweedfs-$(date +%s)"}
-WEED_BINARY=${WEED_BINARY:-"weed"}
-VERBOSE=${VERBOSE:-1}
+# Répertoire de données avec timestamp pour éviter les conflits
+DEFAULT_DATA_DIR="/tmp/seaweedfs-$(date +%Y%m%d-%H%M%S)"
+DATA_DIR="${WEED_DATA_DIR:-$DEFAULT_DATA_DIR}"
+WEED_BINARY="${WEED_BINARY:-weed}"
+VERBOSE="${VERBOSE:-1}"
 
 # Component flags
-START_MASTER=${START_MASTER:-true}
-START_VOLUME=${START_VOLUME:-true}
-START_FILER=${START_FILER:-true}
-START_S3=${START_S3:-false}
-START_MQ=${START_MQ:-false}
+START_MASTER="${START_MASTER:-true}"
+START_VOLUME="${START_VOLUME:-true}"
+START_FILER="${START_FILER:-true}"
+START_S3="${START_S3:-false}"
+START_MQ="${START_MQ:-false}"
 
-# Advanced options
-VOLUME_MAX=${VOLUME_MAX:-100}
-VOLUME_SIZE_LIMIT=${VOLUME_SIZE_LIMIT:-100}
-FILER_MAX_MB=${FILER_MAX_MB:-64}
-USE_RAFT=${USE_RAFT:-true}
-CLEANUP_ON_EXIT=${CLEANUP_ON_EXIT:-true}
+# Advanced options avec valeurs optimisées
+VOLUME_MAX="${VOLUME_MAX:-100}"
+VOLUME_SIZE_LIMIT="${VOLUME_SIZE_LIMIT:-1024}" # 1GB par défaut
+FILER_MAX_MB="${FILER_MAX_MB:-256}" # 256MB par défaut
+USE_RAFT="${USE_RAFT:-true}"
+CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-true}"
+ENABLE_METRICS="${ENABLE_METRICS:-true}"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Timeouts configurables
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-60}"
+HEALTH_CHECK_TIMEOUT="${HEALTH_CHECK_TIMEOUT:-30}"
+
+# Colors for output avec support detection terminal
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; BOLD=''; NC=''
+fi
+
+# Logging functions avec timestamp
+get_timestamp() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
+log() {
+    local level="$1"
+    local color="$2"
+    local message="$3"
+    echo -e "${color}[$(get_timestamp)] [$level]${NC} $message" >&2
+}
 
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    log "INFO" "${GREEN}" "$1"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    log "WARN" "${YELLOW}" "$1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    log "ERROR" "${RED}" "$1"
 }
 
 log_step() {
-    echo -e "${BLUE}[STEP]${NC} $1"
+    log "STEP" "${BLUE}" "$1"
 }
 
-# Function to wait for a service to be ready
-wait_for_service() {
-    local service_name=$1
-    local host=$2
-    local port=$3
-    local max_attempts=${4:-30}
-    local check_type=${5:-"http"} # http or tcp
+log_debug() {
+    if [[ "${VERBOSE}" -ge 2 ]]; then
+        log "DEBUG" "${CYAN}" "$1"
+    fi
+}
+
+# Validation functions
+validate_port() {
+    local port="$1"
+    local service="$2"
     
-    log_step "Waiting for $service_name to be ready on $host:$port..."
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        log_error "Port invalide pour $service: $port"
+        return 1
+    fi
+}
+
+validate_weed_binary() {
+    if ! command -v "$WEED_BINARY" >/dev/null 2>&1; then
+        log_error "Binaire SeaweedFS non trouvé: $WEED_BINARY"
+        log_info "Installez SeaweedFS ou définissez WEED_BINARY avec le chemin correct"
+        return 1
+    fi
     
-    for i in $(seq 1 $max_attempts); do
-        if [ "$check_type" = "http" ]; then
-            if curl -s "http://$host:$port/" > /dev/null 2>&1 || curl -s "http://$host:$port/status" > /dev/null 2>&1; then
-                log_info "✅ $service_name is ready"
-                return 0
-            fi
-        else
-            if nc -z $host $port 2>/dev/null; then
-                log_info "✅ $service_name is ready"
-                return 0
-            fi
-        fi
-        
-        echo "  Waiting for $service_name... ($i/$max_attempts)"
-        sleep 2
+    local version
+    version=$("$WEED_BINARY" version 2>/dev/null | head -1 || echo "unknown")
+    log_info "Utilisation de SeaweedFS: $version"
+}
+
+validate_ports() {
+    local ports=()
+    local services=()
+    
+    [[ "$START_MASTER" == "true" ]] && ports+=("$MASTER_PORT") && services+=("Master")
+    [[ "$START_VOLUME" == "true" ]] && ports+=("$VOLUME_PORT") && services+=("Volume")
+    [[ "$START_FILER" == "true" ]] && ports+=("$FILER_PORT") && services+=("Filer")
+    [[ "$START_S3" == "true" ]] && ports+=("$S3_PORT") && services+=("S3")
+    [[ "$START_MQ" == "true" ]] && ports+=("$MQ_PORT") && services+=("MQ")
+    
+    for i in "${!ports[@]}"; do
+        validate_port "${ports[i]}" "${services[i]}" || return 1
     done
     
-    log_error "❌ $service_name failed to start within $(($max_attempts * 2)) seconds"
+    # Vérification des ports en conflit
+    local unique_ports=()
+    for port in "${ports[@]}"; do
+        if [[ " ${unique_ports[*]} " == *" $port "* ]]; then
+            log_error "Conflit de port détecté: $port utilisé par plusieurs services"
+            return 1
+        fi
+        unique_ports+=("$port")
+    done
+}
+
+# Health check functions
+is_port_available() {
+    local host="$1"
+    local port="$2"
+    ! nc -z "$host" "$port" 2>/dev/null
+}
+
+check_required_ports() {
+    log_step "Vérification des ports requis..."
+    
+    local ports_to_check=()
+    [[ "$START_MASTER" == "true" ]] && ports_to_check+=("$MASTER_PORT")
+    [[ "$START_VOLUME" == "true" ]] && ports_to_check+=("$VOLUME_PORT")
+    [[ "$START_FILER" == "true" ]] && ports_to_check+=("$FILER_PORT")
+    [[ "$START_S3" == "true" ]] && ports_to_check+=("$S3_PORT")
+    [[ "$START_MQ" == "true" ]] && ports_to_check+=("$MQ_PORT")
+    
+    for port in "${ports_to_check[@]}"; do
+        if ! is_port_available "127.0.0.1" "$port"; then
+            log_error "Port $port est déjà utilisé. Libérez le port ou changez la configuration."
+            return 1
+        fi
+    done
+    
+    log_info "✅ Tous les ports sont disponibles"
+}
+
+wait_for_service() {
+    local service_name="$1"
+    local host="$2"
+    local port="$3"
+    local max_attempts="${4:-$HEALTH_CHECK_TIMEOUT}"
+    local check_type="${5:-http}"
+    local endpoint="${6:-/}"
+    
+    log_step "En attente du service $service_name sur $host:$port..."
+    
+    local attempt=1
+    while [[ $attempt -le $max_attempts ]]; do
+        case "$check_type" in
+            http)
+                if curl -s --max-time 2 "http://$host:$port$endpoint" > /dev/null 2>&1 || 
+                   curl -s --max-time 2 "http://$host:$port/status" > /dev/null 2>&1; then
+                    log_info "✅ $service_name est prêt"
+                    return 0
+                fi
+                ;;
+            tcp)
+                if nc -z "$host" "$port" 2>/dev/null; then
+                    log_info "✅ $service_name est prêt"
+                    return 0
+                fi
+                ;;
+            grpc)
+                # Simple TCP check for gRPC port (typically master port + 10000)
+                if nc -z "$host" "$port" 2>/dev/null; then
+                    log_info "✅ $service_name gRPC est prêt"
+                    return 0
+                fi
+                ;;
+        esac
+        
+        if [[ $attempt -eq 1 ]] || [[ $((attempt % 5)) -eq 0 ]]; then
+            log_debug "En attente de $service_name... (tentative $attempt/$max_attempts)"
+        fi
+        
+        sleep 2
+        ((attempt++))
+    done
+    
+    log_error "❌ $service_name n'a pas démarré dans le délai imparti ($((max_attempts * 2)) secondes)"
     return 1
 }
 
-# Function to start master server
+# Component management functions
 start_master() {
-    log_step "Starting SeaweedFS Master Server..."
+    log_step "Démarrage du serveur Master SeaweedFS..."
     
     local raft_flag=""
-    if [ "$USE_RAFT" = "true" ]; then
+    if [[ "$USE_RAFT" == "true" ]]; then
         raft_flag="-raftHashicorp"
+        log_info "Mode Raft activé"
     fi
     
-    nohup $WEED_BINARY -v $VERBOSE master \
-        -port=$MASTER_PORT \
-        -mdir="$DATA_DIR/master" \
-        $raft_flag \
-        -electionTimeout=1s \
-        -volumeSizeLimitMB=$VOLUME_SIZE_LIMIT \
-        -ip="127.0.0.1" \
-        -ip.bind="0.0.0.0" \
-        > "$DATA_DIR/master.log" 2>&1 &
+    local metrics_flag=""
+    if [[ "$ENABLE_METRICS" == "true" ]]; then
+        metrics_flag="-metricsPort=$METRICS_PORT -metricsAddress=127.0.0.1"
+        log_info "Métriques activées sur le port $METRICS_PORT"
+    fi
     
-    echo $! > "$DATA_DIR/master.pid"
+    mkdir -p "$DATA_DIR/master"
     
-    # Wait for master to be ready
-    if ! wait_for_service "Master" "127.0.0.1" "$MASTER_PORT" 30 "http"; then
-        log_error "Master failed to start. Showing last 50 lines of log:"
-        tail -50 "$DATA_DIR/master.log" || echo "Could not read master log"
+    local cmd=(
+        "$WEED_BINARY" -v="$VERBOSE" master
+        -port="$MASTER_PORT"
+        -mdir="$DATA_DIR/master"
+        $raft_flag
+        -electionTimeout="1s"
+        -volumeSizeLimitMB="$VOLUME_SIZE_LIMIT"
+        -ip="127.0.0.1"
+        -ip.bind="0.0.0.0"
+        $metrics_flag
+        -defaultReplication="000"
+    )
+    
+    log_debug "Commande Master: ${cmd[*]}"
+    
+    nohup "${cmd[@]}" > "$DATA_DIR/master.log" 2>&1 &
+    local pid=$!
+    echo $pid > "$DATA_DIR/master.pid"
+    
+    log_info "Master démarré avec PID: $pid"
+    
+    # Wait for master HTTP and gRPC
+    if ! wait_for_service "Master" "127.0.0.1" "$MASTER_PORT" "$STARTUP_TIMEOUT" "http"; then
+        show_component_logs "master" 50
         return 1
     fi
     
-    # Also wait for gRPC port (master port + 10000)
     local grpc_port=$((MASTER_PORT + 10000))
-    if ! wait_for_service "Master gRPC" "127.0.0.1" "$grpc_port" 30 "tcp"; then
-        log_error "Master gRPC failed to start. Showing last 50 lines of log:"
-        tail -50 "$DATA_DIR/master.log" || echo "Could not read master log"
+    if ! wait_for_service "Master gRPC" "127.0.0.1" "$grpc_port" "$STARTUP_TIMEOUT" "grpc"; then
+        show_component_logs "master" 50
         return 1
     fi
+    
+    log_info "✅ Master SeaweedFS démarré avec succès"
 }
 
-# Function to start volume server
 start_volume() {
-    log_step "Starting SeaweedFS Volume Server..."
+    log_step "Démarrage du serveur Volume SeaweedFS..."
     
     mkdir -p "$DATA_DIR/volume"
     
-    nohup $WEED_BINARY -v $VERBOSE volume \
-        -port=$VOLUME_PORT \
-        -dir="$DATA_DIR/volume" \
-        -max=$VOLUME_MAX \
-        -mserver="127.0.0.1:$MASTER_PORT" \
-        -preStopSeconds=1 \
-        -ip="127.0.0.1" \
-        -ip.bind="0.0.0.0" \
-        > "$DATA_DIR/volume.log" 2>&1 &
+    local metrics_flag=""
+    if [[ "$ENABLE_METRICS" == "true" ]]; then
+        metrics_flag="-metricsPort=$((METRICS_PORT + 1)) -metricsAddress=127.0.0.1"
+    fi
     
-    echo $! > "$DATA_DIR/volume.pid"
+    local cmd=(
+        "$WEED_BINARY" -v="$VERBOSE" volume
+        -port="$VOLUME_PORT"
+        -dir="$DATA_DIR/volume"
+        -max="$VOLUME_MAX"
+        -mserver="127.0.0.1:$MASTER_PORT"
+        -preStopSeconds=1
+        -ip="127.0.0.1"
+        -ip.bind="0.0.0.0"
+        $metrics_flag
+    )
     
-    # Wait for volume server to be ready
-    if ! wait_for_service "Volume Server" "127.0.0.1" "$VOLUME_PORT" 30 "http"; then
-        log_error "Volume Server failed to start. Showing last 50 lines of log:"
-        tail -50 "$DATA_DIR/volume.log" || echo "Could not read volume log"
+    log_debug "Commande Volume: ${cmd[*]}"
+    
+    nohup "${cmd[@]}" > "$DATA_DIR/volume.log" 2>&1 &
+    local pid=$!
+    echo $pid > "$DATA_DIR/volume.pid"
+    
+    log_info "Volume Server démarré avec PID: $pid"
+    
+    if ! wait_for_service "Volume Server" "127.0.0.1" "$VOLUME_PORT" "$STARTUP_TIMEOUT" "http"; then
+        show_component_logs "volume" 50
         return 1
     fi
+    
+    log_info "✅ Volume Server démarré avec succès"
 }
 
-# Function to start filer
 start_filer() {
-    log_step "Starting SeaweedFS Filer..."
+    log_step "Démarrage du Filer SeaweedFS..."
     
     mkdir -p "$DATA_DIR/filer"
     
-    nohup $WEED_BINARY -v $VERBOSE filer \
-        -port=$FILER_PORT \
-        -defaultStoreDir="$DATA_DIR/filer" \
-        -master="127.0.0.1:$MASTER_PORT" \
-        -maxMB=$FILER_MAX_MB \
-        -ip="127.0.0.1" \
-        -ip.bind="0.0.0.0" \
-        > "$DATA_DIR/filer.log" 2>&1 &
+    local metrics_flag=""
+    if [[ "$ENABLE_METRICS" == "true" ]]; then
+        metrics_flag="-metricsPort=$((METRICS_PORT + 2)) -metricsAddress=127.0.0.1"
+    fi
     
-    echo $! > "$DATA_DIR/filer.pid"
+    local cmd=(
+        "$WEED_BINARY" -v="$VERBOSE" filer
+        -port="$FILER_PORT"
+        -defaultStoreDir="$DATA_DIR/filer"
+        -master="127.0.0.1:$MASTER_PORT"
+        -maxMB="$FILER_MAX_MB"
+        -ip="127.0.0.1"
+        -ip.bind="0.0.0.0"
+        $metrics_flag
+    )
     
-    # Wait for filer to be ready
-    if ! wait_for_service "Filer" "127.0.0.1" "$FILER_PORT" 30 "http"; then
-        log_error "Filer failed to start. Showing last 50 lines of log:"
-        tail -50 "$DATA_DIR/filer.log" || echo "Could not read filer log"
+    log_debug "Commande Filer: ${cmd[*]}"
+    
+    nohup "${cmd[@]}" > "$DATA_DIR/filer.log" 2>&1 &
+    local pid=$!
+    echo $pid > "$DATA_DIR/filer.pid"
+    
+    log_info "Filer démarré avec PID: $pid"
+    
+    if ! wait_for_service "Filer" "127.0.0.1" "$FILER_PORT" "$STARTUP_TIMEOUT" "http"; then
+        show_component_logs "filer" 50
         return 1
     fi
+    
+    log_info "✅ Filer démarré avec succès"
 }
 
-# Function to start S3 gateway
 start_s3() {
-    log_step "Starting SeaweedFS S3 Gateway..."
+    log_step "Démarrage de la passerelle S3 SeaweedFS..."
     
     local s3_config=""
-    if [ -n "$S3_CONFIG_FILE" ] && [ -f "$S3_CONFIG_FILE" ]; then
+    if [[ -n "$S3_CONFIG_FILE" && -f "$S3_CONFIG_FILE" ]]; then
         s3_config="-config=$S3_CONFIG_FILE"
+        log_info "Utilisation du fichier de configuration S3: $S3_CONFIG_FILE"
     fi
     
-    nohup $WEED_BINARY -v $VERBOSE s3 \
-        -port=$S3_PORT \
-        -filer="127.0.0.1:$FILER_PORT" \
-        -allowEmptyFolder=false \
-        -allowDeleteBucketNotEmpty=true \
-        $s3_config \
-        -ip.bind="0.0.0.0" \
-        > "$DATA_DIR/s3.log" 2>&1 &
+    local cmd=(
+        "$WEED_BINARY" -v="$VERBOSE" s3
+        -port="$S3_PORT"
+        -filer="127.0.0.1:$FILER_PORT"
+        -allowEmptyFolder=false
+        -allowDeleteBucketNotEmpty=true
+        $s3_config
+        -ip.bind="0.0.0.0"
+    )
     
-    echo $! > "$DATA_DIR/s3.pid"
+    log_debug "Commande S3: ${cmd[*]}"
     
-    # Wait for S3 gateway to be ready
-    if ! wait_for_service "S3 Gateway" "127.0.0.1" "$S3_PORT" 30 "http"; then
-        log_error "S3 Gateway failed to start. Showing last 50 lines of log:"
-        tail -50 "$DATA_DIR/s3.log" || echo "Could not read s3 log"
+    nohup "${cmd[@]}" > "$DATA_DIR/s3.log" 2>&1 &
+    local pid=$!
+    echo $pid > "$DATA_DIR/s3.pid"
+    
+    log_info "S3 Gateway démarré avec PID: $pid"
+    
+    if ! wait_for_service "S3 Gateway" "127.0.0.1" "$S3_PORT" "$STARTUP_TIMEOUT" "http"; then
+        show_component_logs "s3" 50
+        return 1
+    fi
+    
+    log_info "✅ S3 Gateway démarré avec succès"
+}
+
+start_mq() {
+    log_step "Démarrage du broker MQ SeaweedFS..."
+    
+    local cmd=(
+        "$WEED_BINARY" -v="$VERBOSE" mq.broker
+        -port="$MQ_PORT"
+        -master="127.0.0.1:$MASTER_PORT"
+        -ip="127.0.0.1"
+        -logFlushInterval=0
+    )
+    
+    log_debug "Commande MQ: ${cmd[*]}"
+    
+    nohup "${cmd[@]}" > "$DATA_DIR/mq.log" 2>&1 &
+    local pid=$!
+    echo $pid > "$DATA_DIR/mq.pid"
+    
+    log_info "MQ Broker démarré avec PID: $pid"
+    
+    if ! wait_for_service "MQ Broker" "127.0.0.1" "$MQ_PORT" "$STARTUP_TIMEOUT" "tcp"; then
+        show_component_logs "mq" 50
+        return 1
+    fi
+    
+    # Donner du temps supplémentaire au broker pour s'enregistrer
+    log_step "Attente de l'enregistrement du broker MQ..."
+    sleep 10
+    
+    log_info "✅ MQ Broker démarré avec succès"
+}
+
+# Utility functions
+show_component_logs() {
+    local component="$1"
+    local lines="${2:-20}"
+    
+    log_error "Dernières $lines lignes du log $component:"
+    if [[ -f "$DATA_DIR/$component.log" ]]; then
+        tail -n "$lines" "$DATA_DIR/$component.log" || echo "Impossible de lire le log $component"
+    else
+        echo "Fichier de log non trouvé: $DATA_DIR/$component.log"
+    fi
+}
+
+check_cluster_health() {
+    log_step "Vérification de la santé du cluster..."
+    
+    if [[ "$START_MASTER" != "true" ]]; then
+        log_info "Master non démarré, vérification de santé ignorée"
+        return 0
+    fi
+    
+    local health_url="http://127.0.0.1:$MASTER_PORT/cluster/health"
+    
+    if curl -s --max-time 5 "$health_url" > /dev/null 2>&1; then
+        log_info "✅ Cluster en bonne santé"
+        return 0
+    else
+        log_warn "⚠️  Impossible de vérifier la santé du cluster"
         return 1
     fi
 }
 
-# Function to start MQ broker
-start_mq() {
-    log_step "Starting SeaweedFS MQ Broker..."
-    
-    nohup $WEED_BINARY -v $VERBOSE mq.broker \
-        -port=$MQ_PORT \
-        -master="127.0.0.1:$MASTER_PORT" \
-        -ip="127.0.0.1" \
-        -logFlushInterval=0 \
-        > "$DATA_DIR/mq.log" 2>&1 &
-    
-    echo $! > "$DATA_DIR/mq.pid"
-    
-    # Wait for MQ broker to be ready
-    wait_for_service "MQ Broker" "127.0.0.1" "$MQ_PORT" 30 "tcp"
-    
-    # Give broker additional time to register with master
-    log_step "Allowing MQ broker to register with master..."
-    sleep 15
-}
-
-# Function to show cluster status
 show_status() {
-    log_step "Checking cluster status..."
+    log_step "État du cluster SeaweedFS..."
     
-    echo "=== Cluster Status ==="
-    curl -s "http://127.0.0.1:$MASTER_PORT/cluster/status" | jq . 2>/dev/null || curl -s "http://127.0.0.1:$MASTER_PORT/cluster/status"
+    echo -e "\n${BOLD}=== État des Processus ===${NC}"
+    local components=("master" "volume" "filer" "s3" "mq")
+    local running=0
+    local total=0
     
-    echo ""
-    echo "=== Directory Status ==="
-    curl -s "http://127.0.0.1:$MASTER_PORT/dir/status" | head -20
-    
-    echo ""
-    echo "=== Running Processes ==="
-    if [ -f "$DATA_DIR/master.pid" ]; then
-        echo "Master PID: $(cat $DATA_DIR/master.pid)"
-    fi
-    if [ -f "$DATA_DIR/volume.pid" ]; then
-        echo "Volume PID: $(cat $DATA_DIR/volume.pid)"
-    fi
-    if [ -f "$DATA_DIR/filer.pid" ]; then
-        echo "Filer PID: $(cat $DATA_DIR/filer.pid)"
-    fi
-    if [ -f "$DATA_DIR/s3.pid" ]; then
-        echo "S3 PID: $(cat $DATA_DIR/s3.pid)"
-    fi
-    if [ -f "$DATA_DIR/mq.pid" ]; then
-        echo "MQ PID: $(cat $DATA_DIR/mq.pid)"
-    fi
-}
-
-# Function to stop all components
-stop_all() {
-    log_step "Stopping all SeaweedFS components..."
-    
-    for component in mq s3 filer volume master; do
-        if [ -f "$DATA_DIR/$component.pid" ]; then
-            local pid=$(cat "$DATA_DIR/$component.pid")
-            if kill -0 $pid 2>/dev/null; then
-                log_info "Stopping $component (PID: $pid)"
-                kill -TERM $pid 2>/dev/null || true
-                # Wait a bit for graceful shutdown
-                sleep 2
-                # Force kill if still running
-                kill -9 $pid 2>/dev/null || true
+    for component in "${components[@]}"; do
+        local pid_file="$DATA_DIR/$component.pid"
+        if [[ -f "$pid_file" ]]; then
+            local pid=$(cat "$pid_file")
+            if kill -0 "$pid" 2>/dev/null; then
+                echo -e "  ✅ ${GREEN}$component${NC} (PID: $pid) ${GREEN}● En cours${NC}"
+                ((running++))
+            else
+                echo -e "  ❌ ${RED}$component${NC} (PID: $pid) ${RED}● Arrêté${NC}"
             fi
-            rm -f "$DATA_DIR/$component.pid"
+            ((total++))
         fi
     done
     
-    # Clean up any remaining weed processes
-    pkill -f "weed.*master\|weed.*volume\|weed.*filer\|weed.*s3\|weed.*mq" 2>/dev/null || true
+    echo -e "\n${BOLD}=== URLs des Services ===${NC}"
+    [[ "$START_MASTER" == "true" ]] && echo "  Master:    http://127.0.0.1:$MASTER_PORT"
+    [[ "$START_VOLUME" == "true" ]] && echo "  Volume:    http://127.0.0.1:$VOLUME_PORT"
+    [[ "$START_FILER" == "true" ]] && echo "  Filer:     http://127.0.0.1:$FILER_PORT"
+    [[ "$START_S3" == "true" ]] && echo "  S3:        http://127.0.0.1:$S3_PORT"
+    [[ "$START_MQ" == "true" ]] && echo "  MQ:        tcp://127.0.0.1:$MQ_PORT"
+    
+    if [[ "$ENABLE_METRICS" == "true" ]]; then
+        echo -e "\n${BOLD}=== Métriques ===${NC}"
+        [[ "$START_MASTER" == "true" ]] && echo "  Master:    http://127.0.0.1:$METRICS_PORT/metrics"
+        [[ "$START_VOLUME" == "true" ]] && echo "  Volume:    http://127.0.0.1:$((METRICS_PORT + 1))/metrics"
+        [[ "$START_FILER" == "true" ]] && echo "  Filer:     http://127.0.0.1:$((METRICS_PORT + 2))/metrics"
+    fi
+    
+    echo -e "\n${BOLD}=== Répertoires ===${NC}"
+    echo "  Données:   $DATA_DIR"
+    echo "  Logs:      $DATA_DIR/*.log"
+    
+    if [[ "$running" -eq "$total" && "$total" -gt 0 ]]; then
+        echo -e "\n${GREEN}✅ Tous les services ($running/$total) sont en cours d'exécution${NC}"
+    else
+        echo -e "\n${YELLOW}⚠️  $running/$total services en cours d'exécution${NC}"
+    fi
 }
 
-# Function to show usage
+stop_all() {
+    log_step "Arrêt de tous les composants SeaweedFS..."
+    
+    local components=("mq" "s3" "filer" "volume" "master")
+    local stopped=0
+    
+    for component in "${components[@]}"; do
+        local pid_file="$DATA_DIR/$component.pid"
+        if [[ -f "$pid_file" ]]; then
+            local pid=$(cat "$pid_file")
+            if kill -0 "$pid" 2>/dev/null; then
+                log_info "Arrêt de $component (PID: $pid)"
+                
+                # Signal TERM gracieux
+                kill -TERM "$pid" 2>/dev/null && \
+                (sleep 5; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null) &
+                local kill_pid=$!
+                
+                # Attendre l'arrêt
+                if wait_for_process_stop "$pid" 10; then
+                    log_info "✅ $component arrêté gracieusement"
+                else
+                    wait "$kill_pid" 2>/dev/null
+                    log_warn "⚠️  $component arrêté de force"
+                fi
+                
+                ((stopped++))
+            fi
+            rm -f "$pid_file"
+        fi
+    done
+    
+    # Nettoyage des processus restants
+    pkill -f "weed.*(master|volume|filer|s3|mq)" 2>/dev/null || true
+    
+    log_info "✅ $stopped composants arrêtés"
+}
+
+wait_for_process_stop() {
+    local pid="$1"
+    local timeout="${2:-10}"
+    local count=0
+    
+    while kill -0 "$pid" 2>/dev/null && [[ $count -lt $timeout ]]; do
+        sleep 1
+        ((count++))
+    done
+    
+    ! kill -0 "$pid" 2>/dev/null
+}
+
+# Gestion des arguments
 show_usage() {
     cat << EOF
-Usage: $0 [OPTIONS]
+Usage: $SCRIPT_NAME [OPTIONS]
 
-Start SeaweedFS components individually for testing.
+Démarre les composants SeaweedFS individuellement pour les tests et le développement.
 
 OPTIONS:
-    -h, --help              Show this help message
-    -d, --data-dir DIR      Data directory (default: /tmp/seaweedfs-timestamp)
-    -b, --binary PATH       Path to weed binary (default: weed)
-    -v, --verbose LEVEL     Verbose level 0-3 (default: 1)
+    -h, --help              Affiche ce message d'aide
+    -v, --version           Affiche la version
+    -d, --data-dir DIR      Répertoire de données (défaut: $DEFAULT_DATA_DIR)
+    -b, --binary PATH       Chemin vers le binaire weed (défaut: weed)
+    -v, --verbose LEVEL     Niveau de verbosité 0-3 (défaut: 1)
     
-    --master-port PORT      Master port (default: 9333)
-    --volume-port PORT      Volume port (default: 8080)
-    --filer-port PORT       Filer port (default: 8888)
-    --s3-port PORT          S3 port (default: 8000)
-    --mq-port PORT          MQ port (default: 17777)
+    --master-port PORT      Port du master (défaut: $MASTER_PORT)
+    --volume-port PORT      Port du volume (défaut: $VOLUME_PORT)
+    --filer-port PORT       Port du filer (défaut: $FILER_PORT)
+    --s3-port PORT          Port S3 (défaut: $S3_PORT)
+    --mq-port PORT          Port MQ (défaut: $MQ_PORT)
+    --metrics-port PORT     Port des métriques (défaut: $METRICS_PORT)
     
-    --no-master             Don't start master
-    --no-volume             Don't start volume server
-    --no-filer              Don't start filer
-    --with-s3               Start S3 gateway
-    --with-mq               Start MQ broker
-    --s3-config FILE        S3 configuration file
+    --no-master             Ne pas démarrer le master
+    --no-volume             Ne pas démarrer le volume
+    --no-filer              Ne pas démarrer le filer
+    --with-s3               Démarrer la passerelle S3
+    --with-mq               Démarrer le broker MQ
+    --s3-config FILE        Fichier de configuration S3
     
-    --volume-max NUM        Max volumes (default: 100)
-    --volume-size-limit MB  Volume size limit (default: 100MB)
-    --filer-max-mb MB       Filer max MB (default: 64MB)
-    --no-raft               Don't use Raft for master
+    --volume-max NUM        Volumes maximum (défaut: $VOLUME_MAX)
+    --volume-size-limit MB  Limite de taille des volumes (défaut: $VOLUME_SIZE_LIMIT)
+    --filer-max-mb MB       MB maximum du filer (défaut: $FILER_MAX_MB)
+    --no-raft               Désactiver Raft pour le master
+    --no-metrics            Désactiver les métriques
     
-    --stop                  Stop all components and exit
-    --status                Show cluster status
-    --no-cleanup-trap       Don't install EXIT trap (for CI use)
+    --startup-timeout SEC   Timeout de démarrage (défaut: $STARTUP_TIMEOUT)
+    --health-timeout SEC    Timeout de santé (défaut: $HEALTH_CHECK_TIMEOUT)
     
-EXAMPLES:
-    # Start basic cluster (master + volume + filer)
-    $0
+    --stop                  Arrêter tous les composants
+    --status                Afficher l'état du cluster
+    --restart               Redémarrer les composants
+    --no-cleanup-trap       Désactiver le nettoyage automatique
     
-    # Start with S3 gateway
-    $0 --with-s3 --s3-config /path/to/s3.json
+EXEMPLES:
+    # Cluster de base (master + volume + filer)
+    $SCRIPT_NAME
     
-    # Start with MQ broker
-    $0 --with-mq
+    # Avec S3 et métriques
+    $SCRIPT_NAME --with-s3 --s3-config ./s3.json
     
-    # Start everything
-    $0 --with-s3 --with-mq --s3-config /path/to/s3.json
+    # Ports personnalisés
+    $SCRIPT_NAME --master-port 9334 --volume-port 8081 --filer-port 8889
     
-    # Custom ports
-    $0 --master-port 9334 --volume-port 8081 --filer-port 8889
-    
-    # Stop all components
-    $0 --stop
+    # Arrêt propre
+    $SCRIPT_NAME --stop
 
-ENVIRONMENT VARIABLES:
-    WEED_DATA_DIR          Data directory
-    WEED_BINARY           Path to weed binary
-    S3_CONFIG_FILE        S3 configuration file
-    
+VARIABLES D'ENVIRONNEMENT:
+    WEED_DATA_DIR          Répertoire de données
+    WEED_BINARY            Chemin vers le binaire weed
+    S3_CONFIG_FILE         Fichier de configuration S3
+    MASTER_PORT            Port du master
+    VOLUME_PORT            Port du volume
+    FILER_PORT             Port du filer
+
 EOF
 }
 
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -h|--help)
-            show_usage
-            exit 0
-            ;;
-        -d|--data-dir)
-            DATA_DIR="$2"
-            shift 2
-            ;;
-        -b|--binary)
-            WEED_BINARY="$2"
-            shift 2
-            ;;
-        -v|--verbose)
-            VERBOSE="$2"
-            shift 2
-            ;;
-        --master-port)
-            MASTER_PORT="$2"
-            shift 2
-            ;;
-        --volume-port)
-            VOLUME_PORT="$2"
-            shift 2
-            ;;
-        --filer-port)
-            FILER_PORT="$2"
-            shift 2
-            ;;
-        --s3-port)
-            S3_PORT="$2"
-            shift 2
-            ;;
-        --mq-port)
-            MQ_PORT="$2"
-            shift 2
-            ;;
-        --no-master)
-            START_MASTER=false
-            shift
-            ;;
-        --no-volume)
-            START_VOLUME=false
-            shift
-            ;;
-        --no-filer)
-            START_FILER=false
-            shift
-            ;;
-        --with-s3)
-            START_S3=true
-            shift
-            ;;
-        --with-mq)
-            START_MQ=true
-            shift
-            ;;
-        --s3-config)
-            S3_CONFIG_FILE="$2"
-            shift 2
-            ;;
-        --volume-max)
-            VOLUME_MAX="$2"
-            shift 2
-            ;;
-        --volume-size-limit)
-            VOLUME_SIZE_LIMIT="$2"
-            shift 2
-            ;;
-        --filer-max-mb)
-            FILER_MAX_MB="$2"
-            shift 2
-            ;;
-        --no-raft)
-            USE_RAFT=false
-            shift
-            ;;
-        --no-cleanup-trap)
-            CLEANUP_ON_EXIT=false
-            shift
-            ;;
-        --stop)
-            stop_all
-            exit 0
-            ;;
-        --status)
-            show_status
-            exit 0
-            ;;
-        *)
-            log_error "Unknown option: $1"
-            show_usage
-            exit 1
-            ;;
-    esac
-done
-
-# Main execution
-main() {
-    log_info "🚀 Starting SeaweedFS Components"
-    echo "Data Directory: $DATA_DIR"
-    echo "Weed Binary: $WEED_BINARY"
-    echo ""
-    
-    # Create data directory
-    mkdir -p "$DATA_DIR"
-    
-    # Set trap to cleanup on exit (unless disabled for CI)
-    if [ "$CLEANUP_ON_EXIT" = "true" ]; then
-        trap 'stop_all' EXIT INT TERM
-    fi
-    
-    # Start components in order
-    if [ "$START_MASTER" = "true" ]; then
-        start_master
-    fi
-    
-    if [ "$START_VOLUME" = "true" ]; then
-        start_volume
-    fi
-    
-    if [ "$START_FILER" = "true" ]; then
-        start_filer
-    fi
-    
-    if [ "$START_S3" = "true" ]; then
-        start_s3
-    fi
-    
-    if [ "$START_MQ" = "true" ]; then
-        start_mq
-    fi
-    
-    # Show final status
-    echo ""
-    show_status
-    
-    log_info "🎉 All requested components started successfully!"
-    echo ""
-    echo "Component URLs:"
-    [ "$START_MASTER" = "true" ] && echo "  Master:  http://127.0.0.1:$MASTER_PORT"
-    [ "$START_VOLUME" = "true" ] && echo "  Volume:  http://127.0.0.1:$VOLUME_PORT"
-    [ "$START_FILER" = "true" ] && echo "  Filer:   http://127.0.0.1:$FILER_PORT"
-    [ "$START_S3" = "true" ] && echo "  S3:      http://127.0.0.1:$S3_PORT"
-    [ "$START_MQ" = "true" ] && echo "  MQ:      tcp://127.0.0.1:$MQ_PORT"
-    echo ""
-    echo "Logs are in: $DATA_DIR/"
-    echo "To stop all components: $0 --stop"
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--version)
+                echo "SeaweedFS Startup Script v$SCRIPT_VERSION"
+                exit 0
+                ;;
+            -d|--data-dir)
+                DATA_DIR="$2"
+                shift 2
+                ;;
+            -b|--binary)
+                WEED_BINARY="$2"
+                shift 2
+                ;;
+            --master-port)
+                MASTER_PORT="$2"
+                shift 2
+                ;;
+            --volume-port)
+                VOLUME_PORT="$2"
+                shift 2
+                ;;
+            --filer-port)
+                FILER_PORT="$2"
+                shift 2
+                ;;
+            --s3-port)
+                S3_PORT="$2"
+                shift 2
+                ;;
+            --mq-port)
+                MQ_PORT="$2"
+                shift 2
+                ;;
+            --metrics-port)
+                METRICS_PORT="$2"
+                shift 2
+                ;;
+            --no-master)
+                START_MASTER=false
+                shift
+                ;;
+            --no-volume)
+                START_VOLUME=false
+                shift
+                ;;
+            --no-filer)
+                START_FILER=false
+                shift
+                ;;
+            --with-s3)
+                START_S3=true
+                shift
+                ;;
+            --with-mq)
+                START_MQ=true
+                shift
+                ;;
+            --s3-config)
+                S3_CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --volume-max)
+                VOLUME_MAX="$2"
+                shift 2
+                ;;
+            --volume-size-limit)
+                VOLUME_SIZE_LIMIT="$2"
+                shift 2
+                ;;
+            --filer-max-mb)
+                FILER_MAX_MB="$2"
+                shift 2
+                ;;
+            --no-raft)
+                USE_RAFT=false
+                shift
+                ;;
+            --no-metrics)
+                ENABLE_METRICS=false
+                shift
+                ;;
+            --startup-timeout)
+                STARTUP_TIMEOUT="$2"
+                shift 2
+                ;;
+            --health-timeout)
+                HEALTH_CHECK_TIMEOUT="$2"
+                shift 2
+                ;;
+            --no-cleanup-trap)
+                CLEANUP_ON_EXIT=false
+                shift
+                ;;
+            --stop)
+                stop_all
+                exit 0
+                ;;
+            --status)
+                show_status
+                exit 0
+                ;;
+            --restart)
+                stop_all
+                sleep 2
+                shift
+                ;;
+            *)
+                log_error "Option inconnue: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
 }
 
-# Run main function
-main
+# Fonction principale
+main() {
+    log_info "🚀 Démarrage des composants SeaweedFS"
+    echo -e "Version: ${BOLD}$SCRIPT_VERSION${NC}"
+    echo -e "Répertoire de données: ${BOLD}$DATA_DIR${NC}"
+    echo -e "Binaire: ${BOLD}$WEED_BINARY${NC}"
+    echo ""
+    
+    # Validation préalable
+    validate_weed_binary || exit 1
+    validate_ports || exit 1
+    check_required_ports || exit 1
+    
+    # Création du répertoire de données
+    mkdir -p "$DATA_DIR"
+    log_info "Répertoire de données créé: $DATA_DIR"
+    
+    # Trap de nettoyage
+    if [[ "$CLEANUP_ON_EXIT" == "true" ]]; then
+        trap 'log_step "Nettoyage en cours..."; stop_all; log_info "Nettoyage terminé"; exit 0' EXIT INT TERM
+    fi
+    
+    # Démarrage séquentiel des composants
+    local components_started=()
+    
+    if [[ "$START_MASTER" == "true" ]]; then
+        start_master && components_started+=("master")
+    fi
+    
+    if [[ "$START_VOLUME" == "true" ]]; then
+        start_volume && components_started+=("volume")
+    fi
+    
+    if [[ "$START_FILER" == "true" ]]; then
+        start_filer && components_started+=("filer")
+    fi
+    
+    if [[ "$START_S3" == "true" ]]; then
+        start_s3 && components_started+=("s3")
+    fi
+    
+    if [[ "$START_MQ" == "true" ]]; then
+        start_mq && components_started+=("mq")
+    fi
+    
+    # Vérification finale
+    echo ""
+    check_cluster_health
+    show_status
+    
+    if [[ ${#components_started[@]} -gt 0 ]]; then
+        log_info "🎉 ${#components_started[@]} composants démarrés avec succès: ${components_started[*]}"
+        echo ""
+        echo -e "${GREEN}${BOLD}SeaweedFS est opérationnel!${NC}"
+        echo ""
+        echo "Pour arrêter: $SCRIPT_NAME --stop"
+        echo "Pour voir l'état: $SCRIPT_NAME --status"
+        echo ""
+        echo -e "${YELLOW}Les logs sont disponibles dans: $DATA_DIR/${NC}"
+    else
+        log_warn "Aucun composant démarré"
+    fi
+}
+
+# Point d'entrée
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    parse_arguments "$@"
+    main
+fi
